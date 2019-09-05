@@ -1,6 +1,6 @@
 # pdf-rest-print
 
-A simple REST API for printing PDF to printers from anywhere with ease
+A simple REST API for printing PDF to printers (with IPP or CUPS) from anywhere with ease
 
 ## Motivation
 
@@ -9,7 +9,7 @@ I could not find a simple web app running on a server with the printer driver in
 ## Requirements
 
 - Python 3
-- A server with CUPS with the printer driver properly installed
+- An IPP capable printer or a server with CUPS with the printer driver properly installed
 - A WSGI server
 
 ## Usage
