@@ -198,12 +198,12 @@ def print_ipp(printer_address, duplex, page_range, orientation, copies, pdf, pdf
 
 class PrintREST(Resource):
     @staticmethod
-    @app.route('/')
+    @app.route('/print')
     def usage():
         return print_upload_form
 
     @staticmethod
-    @app.route('/', methods=['POST'])
+    @app.route('/print', methods=['POST'])
     def print():
         pdf = request.files['uploadedPDF']
         pdf_filename = secure_filename(pdf.filename)
