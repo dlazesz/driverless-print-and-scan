@@ -4,6 +4,7 @@
 import threading
 from io import BytesIO
 from xml.etree import ElementTree
+from json import dumps
 
 from flask import Flask, request, send_file
 from flask_restful import Resource, Api
@@ -25,7 +26,7 @@ class ESCLScanner:
     color_modes_to_name = {v: k for k, v in name_to_color_modes.items()}
 
     query_xml = """<?xml version="1.0" encoding="UTF-8"?>
-    <scan:ScanSettings xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm" 
+    <scan:ScanSettings xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm"
                        xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03">
       <pwg:Version>{0}</pwg:Version>
       <pwg:ScanRegions>
@@ -36,13 +37,43 @@ class ESCLScanner:
           <pwg:YOffset>0</pwg:YOffset>
         </pwg:ScanRegion>
       </pwg:ScanRegions>
-      <pwg:InputSource>Platen</pwg:InputSource>
-      <scan:ColorMode>{3}</scan:ColorMode>
-      <scan:XResolution>{4}</scan:XResolution>
-      <scan:YResolution>{4}</scan:YResolution>
-      <pwg:DocumentFormat>{5}</pwg:DocumentFormat>
-      <scan:Intent>{6}</scan:Intent>
+      <pwg:InputSource>{3}</pwg:InputSource>
+      <scan:ColorMode>{4}</scan:ColorMode>
+      <scan:XResolution>{5}</scan:XResolution>
+      <scan:YResolution>{5}</scan:YResolution>
+      <pwg:DocumentFormat>{6}</pwg:DocumentFormat>
+      <scan:Intent>{7}</scan:Intent>
     </scan:ScanSettings>"""
+
+    @staticmethod
+    def _get_range(inp_caps, namespaces):
+        min_width = int(inp_caps.find('./scan:MinWidth', namespaces).text)
+        max_width = int(inp_caps.find('./scan:MaxWidth', namespaces).text)
+        min_height = int(inp_caps.find('./scan:MinHeight', namespaces).text)
+        max_height = int(inp_caps.find('./scan:MaxHeight', namespaces).text)
+        width_range = range(min_width, max_width+1)
+        height_range = range(min_height, max_height + 1)
+        return width_range, height_range
+
+    @staticmethod
+    def _get_resolutions(inp_caps, namespaces):
+        x_resolutions = [int(e.text)
+                         for e in inp_caps.findall('./scan:SettingProfiles/'
+                                                   'scan:SettingProfile/scan:SupportedResolutions/'
+                                                   'scan:DiscreteResolutions/scan:DiscreteResolution/'
+                                                   'scan:XResolution', namespaces)]
+        y_resolutions = [int(e.text)
+                         for e in inp_caps.findall('./scan:SettingProfiles/'
+                                                   'scan:SettingProfile/scan:SupportedResolutions/'
+                                                   'scan:DiscreteResolutions/scan:DiscreteResolution/'
+                                                   'scan:YResolution', namespaces)]
+        return sorted((min(x, y) for x, y in zip(x_resolutions, y_resolutions)), reverse=True)
+
+    @staticmethod
+    def _get_max_optical_resolution(inp_caps, namespaces):
+        x_max_optical_resolution = int(inp_caps.find('./scan:MaxOpticalXResolution', namespaces).text)
+        y_max_optical_resolution = int(inp_caps.find('./scan:MaxOpticalYResolution', namespaces).text)
+        return min(x_max_optical_resolution, y_max_optical_resolution)
 
     @staticmethod
     def get_capabilities(scanner_ip):
@@ -60,74 +91,62 @@ class ESCLScanner:
         make_and_model = scanner_cap_tree.find('./pwg:MakeAndModel', namespaces).text
         serial_number = scanner_cap_tree.find('./pwg:SerialNumber', namespaces).text
 
-        min_width = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/scan:MinWidth', namespaces).text)
-        max_width = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/scan:MaxWidth', namespaces).text)
-        min_height = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/scan:MinHeight', namespaces).text)
-        max_height = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/scan:MaxHeight', namespaces).text)
-        width_range = range(min_width, max_width+1)
-        height_range = range(min_height, max_height + 1)
+        caps = {}
+        for source_name1, source_name2 in (('Platen', 'Platen'), ('Adf', 'AdfSimplex')):
+            inp_caps = scanner_cap_tree.find('./scan:{0}/scan:{1}InputCaps'.format(source_name1, source_name2),
+                                             namespaces)
 
-        formats = [ESCLScanner.mime_to_format[e.text]
-                   for e in scanner_cap_tree.findall('./scan:Platen/scan:PlatenInputCaps/scan:SettingProfiles/'
-                                                     'scan:SettingProfile/scan:DocumentFormats/pwg:DocumentFormat',
-                                                     namespaces)]
+            width_range, height_range = ESCLScanner._get_range(inp_caps, namespaces)
 
-        color_modes = sorted((ESCLScanner.color_modes_to_name[e.text]
-                              for e in scanner_cap_tree.findall('./scan:Platen/scan:PlatenInputCaps/'
-                                                                'scan:SettingProfiles/scan:SettingProfile/'
-                                                                'scan:ColorModes/scan:ColorMode',
-                                                                namespaces)), reverse=True)
+            formats = [ESCLScanner.mime_to_format[e.text]
+                       for e in inp_caps.findall('./scan:SettingProfiles/scan:SettingProfile/scan:DocumentFormats/'
+                                                 'pwg:DocumentFormat', namespaces)]
 
-        x_resolutions = [int(e.text)
-                         for e in scanner_cap_tree.findall('./scan:Platen/scan:PlatenInputCaps/scan:SettingProfiles/'
-                                                           'scan:SettingProfile/scan:SupportedResolutions/'
-                                                           'scan:DiscreteResolutions/scan:DiscreteResolution/'
-                                                           'scan:XResolution', namespaces)]
-        y_resolutions = [int(e.text)
-                         for e in scanner_cap_tree.findall('./scan:Platen/scan:PlatenInputCaps/scan:SettingProfiles/'
-                                                           'scan:SettingProfile/scan:SupportedResolutions/'
-                                                           'scan:DiscreteResolutions/scan:DiscreteResolution/'
-                                                           'scan:YResolution', namespaces)]
-        resolutions = sorted((min(x, y) for x, y in zip(x_resolutions, y_resolutions)), reverse=True)
+            color_modes = sorted((ESCLScanner.color_modes_to_name[e.text]
+                                  for e in inp_caps.findall('./scan:SettingProfiles/scan:SettingProfile/'
+                                                            'scan:ColorModes/scan:ColorMode',
+                                                            namespaces)), reverse=True)
 
-        supported_intents = [e.text
-                             for e in scanner_cap_tree.findall('./scan:Platen/scan:PlatenInputCaps/'
-                                                               'scan:SupportedIntents/scan:Intent', namespaces)]
+            resolutions = ESCLScanner._get_resolutions(inp_caps, namespaces)
 
-        x_max_optical_resolution = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/'
-                                                             'scan:MaxOpticalXResolution',
-                                                             namespaces).text)
-        y_max_optical_resolution = int(scanner_cap_tree.find('./scan:Platen/scan:PlatenInputCaps/'
-                                                             'scan:MaxOpticalYResolution',
-                                                             namespaces).text)
-        max_optical_resolution = min(x_max_optical_resolution, y_max_optical_resolution)
+            supported_intents = [e.text for e in inp_caps.findall('./scan:SupportedIntents/scan:Intent', namespaces)]
+
+            max_optical_resolution = ESCLScanner._get_max_optical_resolution(inp_caps, namespaces)
+
+            caps[source_name1] = {'width': width_range, 'height': height_range, 'formats': formats,
+                                  'colormodes': color_modes, 'resolutions': resolutions, 'intents': supported_intents,
+                                  'max_optical_resolution': max_optical_resolution}
 
         return status, {'version': escl_version, 'makeandmodel': make_and_model, 'serialnumber': serial_number,
-                        'width': width_range, 'height': height_range, 'formats': formats, 'colormodes': color_modes,
-                        'resolutions': resolutions, 'intents': supported_intents,
-                        'max_optical_resolution': max_optical_resolution}
+                        'caps_by_source': caps}
 
     @staticmethod
-    def _put_together_query(caps, height, width, color_mode, resolution, image_format, intent):
+    def _put_together_query(caps, input_source, height, width, color_mode, resolution, image_format, intent):
         version = caps['version']
-        if height is None:
-            height = caps['height'].stop - 1
-        if width is None:
-            width = caps['width'].stop - 1
+        if input_source not in caps['caps_by_source']:
+            raise ValueError('Input source ({0}) is not in the available input sources ({1})!'.
+                             format(input_source, caps['caps_by_source']))
 
-        checks = [(height, caps['height'], 'Height', 'range'),
-                  (width, caps['width'], 'Width', 'range'),
+        caps_for_curr_source = caps['caps_by_source'][input_source]
+        if height is None:
+            height = caps_for_curr_source['height'].stop - 1
+        if width is None:
+            width = caps_for_curr_source['width'].stop - 1
+
+        checks = [(height, caps_for_curr_source['height'], 'Height', 'range'),
+                  (width, caps_for_curr_source['width'], 'Width', 'range'),
                   (color_mode, ESCLScanner.name_to_color_modes.keys(), 'Color mode', 'modes'),
-                  (resolution, caps['resolutions'], 'Resoluton', 'resolutons'),
+                  (resolution, caps_for_curr_source['resolutions'], 'Resoluton', 'resolutons'),
                   (image_format, ESCLScanner.format_to_mime.keys(), 'Format', 'formats'),
-                  (intent, caps['intents'], 'Intent', 'intents'),
+                  (intent, caps_for_curr_source['intents'], 'Intent', 'intents'),
                   ]
         for value, good_values, name, name_of_values in checks:
             if value not in good_values:
                 raise ValueError('{0} ({1}) is not in {2} ({3})!'.format(name, value, name_of_values, good_values))
 
-        return ESCLScanner.query_xml.format(version, height, width, ESCLScanner.name_to_color_modes[color_mode],
-                                            resolution, ESCLScanner.format_to_mime[image_format], intent)
+        return ESCLScanner.query_xml.format(version, height, width, input_source,
+                                            ESCLScanner.name_to_color_modes[color_mode], resolution,
+                                            ESCLScanner.format_to_mime[image_format], intent)
 
     @staticmethod
     def _post_xml(scanner_ip, xml):
@@ -139,12 +158,13 @@ class ESCLScanner:
         return resp.reason, resp.status_code
 
     @staticmethod
-    def scan(scanner_ip, height, width, color_mode, resolution, image_format, intent):
+    def scan(scanner_ip, input_source, height, width, color_mode, resolution, image_format, intent):
         status, caps = ESCLScanner.get_capabilities(scanner_ip)
         if status != 'Idle':
             ValueError('Scanner Status is not Idle: {0}'.format(status))
         try:
-            xml = ESCLScanner._put_together_query(caps, height, width, color_mode, resolution, image_format, intent)
+            xml = ESCLScanner._put_together_query(caps, input_source, height, width, color_mode, resolution,
+                                                  image_format, intent)
         except ValueError as msg:
             return msg, 400
         return ESCLScanner._post_xml(scanner_ip, xml)
@@ -161,48 +181,107 @@ scan_settings_form = """
 <html>
 <head>
 <style>
-body, html {{
+body, html {
 
     width: 100%;
     height: 100%;
     margin: 0;
     padding: 0;
     display:table;
-}}
-body {{
+}
+body {
     display:table-cell;
     vertical-align:middle;
-}}
-form {{
+}
+form {
     display:table;/* shrinks to fit conntent */
     margin:auto;
-}}
+}
 </style>
+<script>
+// Globals
+var caps = 'JSON_PLACEHOLDER';
+var capsJson = JSON.parse(caps)["caps_by_source"];
+
+function makeRadioButton(name, value, checked) {
+    // From: https://stackoverflow.com/questions/23430455/
+    //       in-html-with-javascript-create-new-radio-button-and-its-text/23430717#23430717
+
+    var label = document.createElement("label");
+    var radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = name;
+    radio.value = value;
+    radio.checked = checked
+
+    label.appendChild(radio);
+    label.appendChild(document.createTextNode(value));
+
+    return label;
+}
+
+function placeRadioButtons(name, text, propValues) {
+    var radioHome = document.getElementById(name);
+    radioHome.innerHTML = "";
+    radioHome.insertAdjacentHTML("afterbegin", text);
+    var first = true;
+    for (var prop in propValues[name]) {
+        radioHome.appendChild(document.createElement("br"));
+        radioHome.appendChild(makeRadioButton(name, propValues[name][prop], first));
+        first = false;
+    }
+}
+
+function refresh() {
+    var x = document.getElementById("inputSource").value;
+    if (x  in capsJson) {
+        var capsInputSource = capsJson[x];
+    }
+    else {
+        alert("Internal error: No such input source!");
+        return false;
+    }
+    document.getElementById("height").placeholder = capsInputSource["height"];
+    document.getElementById("width").placeholder = capsInputSource["width"];
+    placeRadioButtons("colormodes", "Color Mode:", capsInputSource);
+    placeRadioButtons("resolutions", "Resolution:", capsInputSource);
+    placeRadioButtons("formats", "Image Format:", capsInputSource);
+    placeRadioButtons("intents", "Intent:", capsInputSource);
+}
+
+function onload() {
+    var sources = document.getElementById("inputSource");
+    for (var source in capsJson) {
+        var opt = document.createElement("option");
+        opt.value = source;
+        opt.text = source;
+        sources.appendChild(opt);
+    }
+    refresh();
+}
+
+</script>
 </head>
-<body>
+<body onload="onload()">
 
 <form action="" method="post">
     <p>
-       Height x Width: <br/>
-       <input type="number" name="height" placeholder="{0}"> x
-       <input type="number" name="width" placeholder="{1}">
+        Input Source: <br/>
+        <select id="inputSource" name="inputSource" onchange="refresh()">
+        </select>
     </p>
     <p>
-        Color mode: <br/>
-{2}
+        Height x Width: <br/>
+        <input id="height" type="number" name="height" placeholder=0> x
+        <input id="width" type="number" name="width"  placeholder=0>
     </p>
-    <p>
-       Resolution: <br/>
-{3}
+    <p id="colormodes">
     </p>
-    <p>
-        Image format: <br/>
-{4}
+    <p id="resolutions">
     </p>
-
-    <p>
-        Intent: <br/>
-{5}
+    <p id="formats">
+    </p>
+    <p id="intents">
     </p>
     <p>
         <input type="submit" value="Scan" name="submit">
@@ -216,41 +295,28 @@ form {{
 
 class ScanREST(Resource):
     @staticmethod
-    def radio_helper(name, cap):
-        if len(cap) > 0:
-            for i, value in enumerate(cap):
-                checked = ''
-                if i == 0:
-                    checked = 'checked'
-                yield '       <input type="radio" name="{0}" value="{1}" {2}> {1}<br>\n'.format(name, value, checked)
-        else:
-            ValueError('No values for {0}!'.format(name))
-
-    @staticmethod
     @app.route('/scan')
     def usage():
         status, scanner_caps = ESCLScanner.get_capabilities(SCANNER_IP)
         if status != 'Idle':
             return 'Status is not "idle" ({0})!'.format(status), 500
 
-        max_height = scanner_caps['height'].stop-1
-        max_width = scanner_caps['width'].stop-1
-        color_modes = ''.join(radio for radio in ScanREST.radio_helper('color_mode', scanner_caps['colormodes']))
-        resolutions = ''.join(radio for radio in ScanREST.radio_helper('resolution', scanner_caps['resolutions']))
-        image_formats = ''.join(radio for radio in ScanREST.radio_helper('image_format', scanner_caps['formats']))
-        intents = ''.join(radio for radio in ScanREST.radio_helper('intent', scanner_caps['intents']))
-
-        return scan_settings_form.format(max_height, max_width, color_modes, resolutions, image_formats, intents)
+        for source in scanner_caps['caps_by_source'].keys():
+            scanner_caps['caps_by_source'][source]['height'] = scanner_caps['caps_by_source'][source]['height'].stop - 1
+            scanner_caps['caps_by_source'][source]['width'] = scanner_caps['caps_by_source'][source]['width'].stop - 1
+        json = dumps(scanner_caps)
+        return scan_settings_form.replace('JSON_PLACEHOLDER', json)
 
     @staticmethod
     @app.route('/scan', methods=['POST'])
     def scan():
+        input_source = request.form['inputSource']
         height = request.form['height']
         width = request.form['width']
-        color_mode = request.form['color_mode']
-        resolution = request.form['resolution']
-        image_format = request.form['image_format']
-        intent = request.form['intent']
+        color_mode = request.form['colormodes']
+        resolution = request.form['resolutions']
+        image_format = request.form['formats']
+        intent = request.form['intents']
 
         try:
             if len(height) > 0:
@@ -266,7 +332,8 @@ class ScanREST(Resource):
             return 'Values of {0} must be Integer instead of {1}!'.format('Height, Width and Resolution',
                                                                           ', '.join((height, width, resolution))), 400
 
-        msg, status = ESCLScanner.scan(SCANNER_IP, height, width, color_mode, resolution, image_format, intent)
+        msg, status = ESCLScanner.scan(SCANNER_IP, input_source, height, width, color_mode, resolution, image_format,
+                                       intent)
         if status == 201:
             response = requests_get(msg, stream=True)
             headers = dict(response.headers)
