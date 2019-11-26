@@ -72,6 +72,7 @@ Motto:
                 # Do not forget to add password protection!
                 include proxy_params;
                 proxy_pass http://unix:/var/www/driverless_print_and_scan_venv/driverless-print-and-scan/printREST.sock;
+                client_max_body_size 100M;  # 1MB is the default upload limit! 
             }
             ```
         - Restart _Nginx_ `sudo systemctl restart nginx`
