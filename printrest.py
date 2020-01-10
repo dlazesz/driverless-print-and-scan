@@ -187,7 +187,7 @@ def print_ipp(printer_address, duplex, page_range, orientation, copies, pdf, pdf
     fh.write(print_job_config)
     fh.close()
     pdf.save(pdf_path)
-    ret = subprocess.run(['ipptool', printer_uri, config_file, '-f', pdf_path], stderr=subprocess.PIPE)
+    ret = subprocess.run(['/usr/bin/ipptool', printer_uri, config_file, '-f', pdf_path], stderr=subprocess.PIPE)
     os.remove(pdf_path)
     os.remove(config_file)
     if ret.returncode != 0:

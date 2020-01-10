@@ -13,9 +13,13 @@ from requests import get as requests_get, post as requests_post
 
 # To be edited...
 SCANNER_IP = '192.168.X.X'
+ALLOW_MAX_A4_SIZE = False
 
 
 class ESCLScanner:
+    a4_width_px_300dpi = 2480
+    a4_height_px_300dpi = 3508
+
     # These are scanner dependent values...
     format_to_mime = {'PDF': 'application/pdf', 'JPEG': 'image/jpeg'}
     name_to_color_modes = {'BackAndWhite': 'BlackAndWhite1', 'Grayscale': 'Grayscale8', 'Color': 'RGB24'}
@@ -47,10 +51,19 @@ class ESCLScanner:
 
     @staticmethod
     def _get_range(inp_caps, namespaces):
+        """
+        A4 (210mm x 297mm) 2480px x 3508px @300DPI
+        The latter format is returned. Must compute other sizes for other DPIs!
+        """
         min_width = int(inp_caps.find('./scan:MinWidth', namespaces).text)
         max_width = int(inp_caps.find('./scan:MaxWidth', namespaces).text)
         min_height = int(inp_caps.find('./scan:MinHeight', namespaces).text)
         max_height = int(inp_caps.find('./scan:MaxHeight', namespaces).text)
+
+        if ALLOW_MAX_A4_SIZE:
+            max_width = min(max_width, ESCLScanner.a4_width_px_300dpi)
+            max_height = min(max_height, ESCLScanner.a4_height_px_300dpi)
+
         width_range = range(min_width, max_width+1)
         height_range = range(min_height, max_height + 1)
         return width_range, height_range
@@ -92,7 +105,8 @@ class ESCLScanner:
         serial_number = scanner_cap_tree.find('./pwg:SerialNumber', namespaces).text
 
         caps = {}
-        for source_name1, source_name2 in (('Platen', 'Platen'), ('Adf', 'AdfSimplex')):
+        for source_name1, source_name2, source_name3 in \
+                (('Platen', 'Platen', 'Platen'), ('Adf', 'AdfSimplex', 'Feeder')):
             inp_caps = scanner_cap_tree.find('./scan:{0}/scan:{1}InputCaps'.format(source_name1, source_name2),
                                              namespaces)
 
@@ -109,11 +123,18 @@ class ESCLScanner:
 
             resolutions = ESCLScanner._get_resolutions(inp_caps, namespaces)
 
+            # Comnpute pixel ranges for different DPIs (must be supplied in 300DPI to the scanner!)
+            width_ranges = {}
+            height_ranges = {}
+            for res in resolutions:
+                width_ranges[res] = range(width_range.start, (width_range.stop-1)*res//300+1)
+                height_ranges[res] = range(height_range.start, (height_range.stop-1)*res//300+1)
+
             supported_intents = [e.text for e in inp_caps.findall('./scan:SupportedIntents/scan:Intent', namespaces)]
 
             max_optical_resolution = ESCLScanner._get_max_optical_resolution(inp_caps, namespaces)
 
-            caps[source_name1] = {'width': width_range, 'height': height_range, 'formats': formats,
+            caps[source_name3] = {'width': width_ranges, 'height': height_ranges, 'formats': formats,
                                   'colormodes': color_modes, 'resolutions': resolutions, 'intents': supported_intents,
                                   'max_optical_resolution': max_optical_resolution}
 
@@ -128,21 +149,26 @@ class ESCLScanner:
                              format(input_source, caps['caps_by_source']))
 
         caps_for_curr_source = caps['caps_by_source'][input_source]
-        if height is None:
-            height = caps_for_curr_source['height'].stop - 1
-        if width is None:
-            width = caps_for_curr_source['width'].stop - 1
 
-        checks = [(height, caps_for_curr_source['height'], 'Height', 'range'),
-                  (width, caps_for_curr_source['width'], 'Width', 'range'),
+        if height is None:
+            height = caps_for_curr_source['height'].get(resolution, 300).stop - 1
+        if width is None:
+            width = caps_for_curr_source['width'].get(resolution, 300).stop - 1
+
+        checks = [(resolution, caps_for_curr_source['resolutions'], 'Resoluton', 'resolutons'),
+                  (height, caps_for_curr_source['height'][resolution], 'Height', 'range'),
+                  (width, caps_for_curr_source['width'][resolution], 'Width', 'range'),
                   (color_mode, ESCLScanner.name_to_color_modes.keys(), 'Color mode', 'modes'),
-                  (resolution, caps_for_curr_source['resolutions'], 'Resoluton', 'resolutons'),
                   (image_format, ESCLScanner.format_to_mime.keys(), 'Format', 'formats'),
                   (intent, caps_for_curr_source['intents'], 'Intent', 'intents'),
                   ]
         for value, good_values, name, name_of_values in checks:
             if value not in good_values:
                 raise ValueError('{0} ({1}) is not in {2} ({3})!'.format(name, value, name_of_values, good_values))
+
+        # Scale the height and width to 300DPI for the XML
+        height = height*300//resolution
+        width = width*300//resolution
 
         return ESCLScanner.query_xml.format(version, height, width, input_source,
                                             ESCLScanner.name_to_color_modes[color_mode], resolution,
@@ -153,7 +179,6 @@ class ESCLScanner:
         resp = requests_post('http://{0}/eSCL/ScanJobs'.format(scanner_ip), data=xml,
                              headers={'Content-Type': 'text/xml'})
         if resp.status_code == 201:
-            '{0}/NextDocument'.format(resp.headers['Location'])
             return '{0}/NextDocument'.format(resp.headers['Location']), 201
         return resp.reason, resp.status_code
 
@@ -241,10 +266,24 @@ function refresh() {
         alert("Internal error: No such input source!");
         return false;
     }
-    document.getElementById("height").placeholder = capsInputSource["height"];
-    document.getElementById("width").placeholder = capsInputSource["width"];
     placeRadioButtons("colormodes", "Color Mode:", capsInputSource);
     placeRadioButtons("resolutions", "Resolution:", capsInputSource);
+
+    // Adjust height and width to resolution
+    var x = document.getElementsByName("resolutions");
+    for (var i = 0; i < x.length; i++) {
+        if (x[i].type == "radio") {
+            x[i].addEventListener("change", function() {
+                document.getElementById("height").placeholder = capsInputSource["height"][this.value];
+                document.getElementById("width").placeholder = capsInputSource["width"][this.value];
+            });
+        }
+        if (i == 0) {
+            document.getElementById("height").placeholder = capsInputSource["height"][x[i].value];
+            document.getElementById("width").placeholder = capsInputSource["width"][x[i].value];
+        }
+    }
+
     placeRadioButtons("formats", "Image Format:", capsInputSource);
     placeRadioButtons("intents", "Intent:", capsInputSource);
 }
@@ -299,11 +338,15 @@ class ScanREST(Resource):
     def usage():
         status, scanner_caps = ESCLScanner.get_capabilities(SCANNER_IP)
         if status != 'Idle':
-            return 'Status is not "idle" ({0})!'.format(status), 500
+            return 'Status is not "Idle" ({0})!'.format(status), 500
 
+        # Replace ranges with maximum values
         for source in scanner_caps['caps_by_source'].keys():
-            scanner_caps['caps_by_source'][source]['height'] = scanner_caps['caps_by_source'][source]['height'].stop - 1
-            scanner_caps['caps_by_source'][source]['width'] = scanner_caps['caps_by_source'][source]['width'].stop - 1
+            for res in scanner_caps['caps_by_source'][source]['height'].keys():
+                scanner_caps['caps_by_source'][source]['height'][res] = \
+                    scanner_caps['caps_by_source'][source]['height'][res].stop - 1
+                scanner_caps['caps_by_source'][source]['width'][res] = \
+                    scanner_caps['caps_by_source'][source]['width'][res].stop - 1
         json = dumps(scanner_caps)
         return scan_settings_form.replace('JSON_PLACEHOLDER', json)
 
